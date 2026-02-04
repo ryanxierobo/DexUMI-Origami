@@ -1,0 +1,12 @@
+
+Position visualizations:
+angle_B_X1_A: *
+angle_X1_A_C: *
+angle_A_X1_X2: *|
+angle_X2_C_D: |*
+link_C_D_y: |||*||
+link_X1_X2_y: |||*||
+link_A_C_y: ||*|||
+link_X2_C_y: |||||*|
+link_x1_A_y: ||||*
+link_x1_B_y: *||||

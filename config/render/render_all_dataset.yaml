@@ -1,0 +1,15 @@
+dev_dir: ${oc.env:DEV_PATH}
+hydra:
+  run:
+    dir: ${dev_dir}/DexUMI/experiment/render/${now:%Y-%m-%d_%H-%M-%S}
+
+avaliable_gpu: [0]
+data_buffer_path: /path/to/data_buffer
+data_dir: ${data_buffer_path}
+reference_dir: /path/to/reference
+sam2_checkpoint_path: ${dev_dir}/sam2/checkpoints/sam2.1_hiera_large.pt
+save_path: ${data_buffer_path}
+resize_ratio: 1.0
+
+start_episode: null
+end_episode: null

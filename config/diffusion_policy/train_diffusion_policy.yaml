@@ -1,0 +1,86 @@
+store_dir: ${oc.env:STORE_PATH}
+dev_dir: ${oc.env:DEV_PATH}
+hydra:
+  run:
+    dir: ${dev_dir}/exoskeleton/experiment/dp/${now:%Y-%m-%d_%H-%M-%S}
+
+
+project_name: DexUMI
+
+
+debug: False
+action_dim: 18
+
+ema:
+  _target_: exoskeleton.common.ema_model.EMAModel
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.9999
+
+training:
+  epochs: 10000
+  gradient_accumulation_steps: 1
+  batch_size: 300
+  num_workers: 4
+  shuffle: True
+  pin_memory: False
+  persistent_workers: True
+  drop_last: False
+  ckpt_frequency: 100
+  resume: False
+  model_path: null
+  model_ckpt: null
+  use_ema: True
+
+noise_scheduler:
+  _target_: diffusers.DDIMScheduler
+  num_train_timesteps: 50
+  beta_start: 0.0001
+  beta_end: 0.02
+  beta_schedule: squaredcos_cap_v2
+  clip_sample: True 
+  prediction_type: epsilon 
+num_inference_steps: 16
+
+optimizer: 
+  _target_: torch.optim.AdamW
+  lr: 1e-4
+  betas: [0.9, 0.999]
+  weight_decay: 1e-2
+  eps: 1e-08
+
+lr_scheduler: "cosine"
+num_warmup_steps: 500
+
+dataset:
+  _target_: exoskeleton.diffusion_policy.dataloader.dexumi_dataset.DexUMIDataset
+  data_dirs: [
+    "path/to/dataset",
+  ]
+  load_camera_ids: [0]
+  camera_resize_shape: [240,240]
+  pred_horizon: 16
+  obs_horizon: 1
+  action_horizon: 8
+  unnormal_list: ["camera_0","pose"]
+  optional_transforms: ["Resize","RandomCrop","ColorJitter","RandomGrayscale","GaussianBlur"]
+  relative_hand_action: False
+  skip_proprioception: True
+  enable_fsr: False
+  bgr2rgb: True
+  max_episode: null
+  fsr_binary_cutoff: [10,10,10] #xhand 
+
+
+
+model:
+  _target_: exoskeleton.diffusion_policy.diffusion_policy.DiffusionPolicy
+  vision_backbone_kwargs: 
+    model_name: "vit_small_patch8_224.dino"
+  freeze_vision_back: False
+  diffusion_policy_head:
+    _target_: exoskeleton.diffusion_policy.model.diffusion_model.ConditionalUnet1D
+    input_dim: ${action_dim}
+    global_cond_dim: 384
