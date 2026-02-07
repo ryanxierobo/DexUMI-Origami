@@ -204,23 +204,22 @@ class VideoRecorder:
             last_timestamp = first_frame.receive_time
             start_time = time.monotonic()
             frame_received = 0
+            t_write_total = 0.0
+            t_get_total = 0.0
 
             while self._recording_event.is_set():
                 with FrameRateContext(fps, verbose=self.verbose) as fr:
+                    t0 = time.monotonic()
                     frame_data = self.get_next_frame(
                         camera_idx, last_timestamp, timeout=1 / fps
                     )
+                    t1 = time.monotonic()
+                    t_get_total += (t1 - t0)
                     if frame_data is None:
-                        print("No frames in queue!")
                         continue
                     else:
                         frame_received += 1
                         last_timestamp = frame_data.receive_time
-                        actual_fps = frame_received / (time.monotonic() - start_time)
-                        if self.verbose:
-                            print(
-                                f"Actual FPS for camera_{camera_idx} recording: {actual_fps}"
-                            )
 
                     for field in fields(self.frame_data_class):
                         value = getattr(frame_data, field.name)
@@ -228,13 +227,23 @@ class VideoRecorder:
                             if field.name == "rgb":
                                 if self.convert_bgr_to_rgb:
                                     value = cv2.cvtColor(value, cv2.COLOR_BGR2RGB)
+                                tw0 = time.monotonic()
                                 video_writer.write(value)
-                                if self.verbose:
-                                    print(
-                                        f"Written frame to video for camera {camera_idx}"
-                                    )
+                                tw1 = time.monotonic()
+                                t_write_total += (tw1 - tw0)
                             if field.name in self.frame_data_class.numeric_fields():
                                 stored_frame[field.name].append(value)
+
+                    if frame_received % 30 == 0:
+                        elapsed = time.monotonic() - start_time
+                        print(
+                            f"[REC cam{camera_idx}] fps={frame_received/elapsed:.1f} "
+                            f"get={1000*t_get_total/30:.1f}ms "
+                            f"write={1000*t_write_total/30:.1f}ms "
+                            f"shape={first_frame.rgb.shape}"
+                        )
+                        t_get_total = 0.0
+                        t_write_total = 0.0
         except Exception as e:
             print(f"Error processing frame from camera {camera_idx}: {e}")
 
