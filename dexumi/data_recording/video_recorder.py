@@ -90,7 +90,7 @@ class VideoRecorder:
         # Delete existing video files if they exist
         for i in range(len(self.camera_sources)):
             video_path = os.path.join(
-                self.video_record_path, f"episode_{self.episode_id}", f"camera_{i}.mp4"
+                self.video_record_path, f"episode_{self.episode_id}", f"camera_{i}.avi"
             )
             if os.path.exists(video_path):
                 os.remove(video_path)
@@ -185,7 +185,7 @@ class VideoRecorder:
         video_path = os.path.join(
             self.video_record_path,
             f"episode_{episode_id}",
-            f"camera_{camera_idx}.mp4",
+            f"camera_{camera_idx}.avi",
         )
         fps = self.record_fps
         # Get first frame to determine dimensions and initialize video writer
@@ -197,9 +197,10 @@ class VideoRecorder:
         frame = first_frame.rgb
         height, width = frame.shape[:2]
         print("video_path", video_path)
-        self.video_writers[camera_idx] = cv2.VideoWriter(  # Store in instance variable
+        # Use MJPEG codec — much faster than mp4v (no inter-frame compression)
+        self.video_writers[camera_idx] = cv2.VideoWriter(
             video_path,
-            cv2.VideoWriter_fourcc(*"mp4v"),
+            cv2.VideoWriter_fourcc(*"MJPG"),
             fps,
             (width, height),
         )
