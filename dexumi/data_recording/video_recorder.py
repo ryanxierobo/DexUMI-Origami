@@ -1,5 +1,6 @@
 import copy
 import os
+import subprocess
 import threading
 import time
 from collections import deque
@@ -24,6 +25,47 @@ from dexumi.common.utility.zarr import parallel_saving
 register_codecs()
 
 
+class FFmpegVideoWriter:
+    """Drop-in replacement for cv2.VideoWriter using ffmpeg subprocess.
+
+    Pipes raw frames to ffmpeg for encoding, running in a separate OS process
+    to avoid Python GIL contention. Uses libx264 ultrafast preset by default.
+    """
+
+    def __init__(self, path: str, fps: int, width: int, height: int,
+                 pix_fmt: str = "rgb24", preset: str = "ultrafast"):
+        self._path = path
+        self._width = width
+        self._height = height
+        self._frame_size = width * height * 3  # RGB24
+        self._proc = subprocess.Popen(
+            [
+                "ffmpeg", "-y",
+                "-f", "rawvideo",
+                "-pix_fmt", pix_fmt,
+                "-s", f"{width}x{height}",
+                "-r", str(fps),
+                "-i", "pipe:",
+                "-c:v", "libx264",
+                "-preset", preset,
+                "-pix_fmt", "yuv420p",
+                path,
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    def write(self, frame: np.ndarray) -> None:
+        if self._proc.stdin and not self._proc.stdin.closed:
+            self._proc.stdin.write(frame.tobytes())
+
+    def release(self) -> None:
+        if self._proc.stdin and not self._proc.stdin.closed:
+            self._proc.stdin.close()
+        self._proc.wait(timeout=10)
+
+
 class VideoRecorder:
     def __init__(
         self,
@@ -36,7 +78,9 @@ class VideoRecorder:
         convert_bgr_to_rgb: bool = False,
         max_workers: int = 32,
         frame_queue_size: int = 20,
+        use_ffmpeg: bool = False,
     ) -> None:
+        self.use_ffmpeg: bool = use_ffmpeg
         self.video_record_path: str = video_record_path
         self.camera_sources: List[Camera] = camera_sources
         camera_names = [camera.camera_name for camera in camera_sources]
@@ -191,12 +235,17 @@ class VideoRecorder:
         frame = first_frame.rgb
         height, width = frame.shape[:2]
         print("video_path", video_path)
-        self.video_writers[camera_idx] = cv2.VideoWriter(  # Store in instance variable
-            video_path,
-            cv2.VideoWriter_fourcc(*"mp4v"),
-            fps,
-            (width, height),
-        )
+        if self.use_ffmpeg:
+            self.video_writers[camera_idx] = FFmpegVideoWriter(
+                video_path, fps, width, height,
+            )
+        else:
+            self.video_writers[camera_idx] = cv2.VideoWriter(
+                video_path,
+                cv2.VideoWriter_fourcc(*"mp4v"),
+                fps,
+                (width, height),
+            )
         if self.verbose:
             print(f"Initialized video writer for camera {camera_idx}")
         video_writer = self.video_writers[camera_idx]  # Use local reference
