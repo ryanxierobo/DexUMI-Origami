@@ -135,38 +135,44 @@ class VideoRecorder:
         queue = self.frame_queues[camera_idx]
         start_time = time.monotonic()
         frame_received = 0
+        # Debug timing
+        debug_interval = 60  # Print every N frames
+        t_get_total = 0.0
+        t_queue_total = 0.0
         while self._streaming_event.is_set():
             try:
                 with FrameRateContext(self.stream_fps, verbose=self.verbose) as fr:
+                    t0 = time.monotonic()
                     frame_data = camera.get_camera_frame()
+                    t1 = time.monotonic()
                     if frame_data.rgb is not None:
                         # Check if queue is full first
                         frame_received += 1
-                        if self.verbose:
-                            actual_fps = frame_received / (
-                                time.monotonic() - start_time
-                            )
-                            # print(
-                            #     f"Actual FPS for camera {camera_idx} streaming: {actual_fps}"
-                            # )
+                        t_get_total += (t1 - t0)
                         if queue.full():
                             try:
                                 queue.get_nowait()  # Remove oldest frame
-                                if self.verbose:
-                                    print(
-                                        f"Queue full for camera {camera_idx}, removed oldest frame"
-                                    )
                             except Empty:
                                 pass
 
                         try:
                             queue.put_nowait(frame_data)
-                            if self.verbose:
-                                print(f"Put frame queued from camera {camera_idx}")
-                                # print("queue size", queue.qsize())
                         except Full:
-                            if self.verbose:
-                                print(f"Failed to put frame for camera {camera_idx}")
+                            pass
+                        t2 = time.monotonic()
+                        t_queue_total += (t2 - t1)
+
+                        if frame_received % debug_interval == 0:
+                            elapsed = time.monotonic() - start_time
+                            avg_fps = frame_received / elapsed
+                            print(
+                                f"[STREAM cam{camera_idx}] fps={avg_fps:.1f} "
+                                f"get_frame={1000*t_get_total/debug_interval:.1f}ms "
+                                f"queue={1000*t_queue_total/debug_interval:.2f}ms "
+                                f"qsize={queue.qsize()}"
+                            )
+                            t_get_total = 0.0
+                            t_queue_total = 0.0
                     else:
                         print(f"No frame data from camera {camera_idx}")
             except Exception as e:
@@ -204,39 +210,72 @@ class VideoRecorder:
             last_timestamp = first_frame.receive_time
             start_time = time.monotonic()
             frame_received = 0
+            missed_frames = 0
+            # Debug timing accumulators (reset every debug_interval frames)
+            debug_interval = 30
+            t_get_total = 0.0
+            t_write_total = 0.0
+            t_other_total = 0.0
 
             while self._recording_event.is_set():
-                with FrameRateContext(fps, verbose=self.verbose) as fr:
-                    frame_data = self.get_next_frame(
-                        camera_idx, last_timestamp, timeout=1 / fps
-                    )
-                    if frame_data is None:
-                        print("No frames in queue!")
-                        continue
-                    else:
-                        frame_received += 1
-                        last_timestamp = frame_data.receive_time
-                        actual_fps = frame_received / (time.monotonic() - start_time)
-                        if self.verbose:
-                            print(
-                                f"Actual FPS for camera_{camera_idx} recording: {actual_fps}"
-                            )
+                t_iter_start = time.monotonic()
 
-                    for field in fields(self.frame_data_class):
-                        value = getattr(frame_data, field.name)
-                        if value is not None:
-                            if field.name == "rgb":
-                                if self.convert_bgr_to_rgb:
-                                    value = cv2.cvtColor(value, cv2.COLOR_BGR2RGB)
-                                video_writer.write(value)
-                                if self.verbose:
-                                    print(
-                                        f"Written frame to video for camera {camera_idx}"
-                                    )
-                            if field.name in self.frame_data_class.numeric_fields():
-                                stored_frame[field.name].append(value)
+                # --- get_next_frame ---
+                frame_data = self.get_next_frame(
+                    camera_idx, last_timestamp, timeout=1 / fps
+                )
+                t_after_get = time.monotonic()
+                t_get_total += (t_after_get - t_iter_start)
+
+                if frame_data is None:
+                    missed_frames += 1
+                    if missed_frames % debug_interval == 0:
+                        print(f"[REC cam{camera_idx}] MISSED {missed_frames} total, timeout={1000/fps:.1f}ms")
+                    continue
+
+                frame_received += 1
+                last_timestamp = frame_data.receive_time
+
+                # --- write frame + store metadata ---
+                t_write_start = time.monotonic()
+                for field in fields(self.frame_data_class):
+                    value = getattr(frame_data, field.name)
+                    if value is not None:
+                        if field.name == "rgb":
+                            if self.convert_bgr_to_rgb:
+                                value = cv2.cvtColor(value, cv2.COLOR_BGR2RGB)
+                            video_writer.write(value)
+                        if field.name in self.frame_data_class.numeric_fields():
+                            stored_frame[field.name].append(value)
+                t_after_write = time.monotonic()
+                t_write_total += (t_after_write - t_write_start)
+
+                # --- FrameRateContext sleep (enforce record_fps) ---
+                remaining = (1.0 / fps) - (t_after_write - t_iter_start)
+                if remaining > 0:
+                    time.sleep(remaining)
+                t_iter_end = time.monotonic()
+                t_other_total += (t_iter_end - t_after_write)
+
+                # --- periodic debug print ---
+                if frame_received % debug_interval == 0:
+                    elapsed = time.monotonic() - start_time
+                    avg_fps = frame_received / elapsed
+                    print(
+                        f"[REC cam{camera_idx}] fps={avg_fps:.1f} "
+                        f"get={1000*t_get_total/debug_interval:.1f}ms "
+                        f"write={1000*t_write_total/debug_interval:.1f}ms "
+                        f"sleep={1000*t_other_total/debug_interval:.1f}ms "
+                        f"total={1000*(t_get_total+t_write_total+t_other_total)/debug_interval:.1f}ms "
+                        f"missed={missed_frames} qsize={self.frame_queues[camera_idx].qsize()}"
+                    )
+                    t_get_total = 0.0
+                    t_write_total = 0.0
+                    t_other_total = 0.0
         except Exception as e:
+            import traceback
             print(f"Error processing frame from camera {camera_idx}: {e}")
+            traceback.print_exc()
 
     def peek_latest_frame(self, camera_idx: int) -> Optional[FrameData]:
         """Peek the latest frame from the queue without removing it"""
