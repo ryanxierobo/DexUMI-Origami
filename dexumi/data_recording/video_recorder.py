@@ -61,10 +61,6 @@ class VideoRecorder:
         # Initialize thread lists
         self.camera_threads: List[Thread] = []
         self.recording_threads: List[Thread] = []
-        self.writer_threads: List[Thread] = []
-        # Buffered frame queues for async video writing (deques per camera)
-        self.write_buffers: List[deque] = [deque() for _ in camera_sources]
-        self._writing_event: Event = Event()  # Signals writer threads to keep running
 
         self._episode_id = self.init_episode_id()
         print(f"Starting episode {self.episode_id}")
@@ -139,44 +135,38 @@ class VideoRecorder:
         queue = self.frame_queues[camera_idx]
         start_time = time.monotonic()
         frame_received = 0
-        # Debug timing
-        debug_interval = 60  # Print every N frames
-        t_get_total = 0.0
-        t_queue_total = 0.0
         while self._streaming_event.is_set():
             try:
                 with FrameRateContext(self.stream_fps, verbose=self.verbose) as fr:
-                    t0 = time.monotonic()
                     frame_data = camera.get_camera_frame()
-                    t1 = time.monotonic()
                     if frame_data.rgb is not None:
                         # Check if queue is full first
                         frame_received += 1
-                        t_get_total += (t1 - t0)
+                        if self.verbose:
+                            actual_fps = frame_received / (
+                                time.monotonic() - start_time
+                            )
+                            # print(
+                            #     f"Actual FPS for camera {camera_idx} streaming: {actual_fps}"
+                            # )
                         if queue.full():
                             try:
                                 queue.get_nowait()  # Remove oldest frame
+                                if self.verbose:
+                                    print(
+                                        f"Queue full for camera {camera_idx}, removed oldest frame"
+                                    )
                             except Empty:
                                 pass
 
                         try:
                             queue.put_nowait(frame_data)
+                            if self.verbose:
+                                print(f"Put frame queued from camera {camera_idx}")
+                                # print("queue size", queue.qsize())
                         except Full:
-                            pass
-                        t2 = time.monotonic()
-                        t_queue_total += (t2 - t1)
-
-                        if frame_received % debug_interval == 0:
-                            elapsed = time.monotonic() - start_time
-                            avg_fps = frame_received / elapsed
-                            print(
-                                f"[STREAM cam{camera_idx}] fps={avg_fps:.1f} "
-                                f"get_frame={1000*t_get_total/debug_interval:.1f}ms "
-                                f"queue={1000*t_queue_total/debug_interval:.2f}ms "
-                                f"qsize={queue.qsize()}"
-                            )
-                            t_get_total = 0.0
-                            t_queue_total = 0.0
+                            if self.verbose:
+                                print(f"Failed to put frame for camera {camera_idx}")
                     else:
                         print(f"No frame data from camera {camera_idx}")
             except Exception as e:
@@ -184,8 +174,7 @@ class VideoRecorder:
                 time.sleep(0.1)
 
     def _recording_thread(self, camera_idx, episode_id):
-        """Thread function to capture frames from queue into memory buffer.
-        Video encoding happens in a separate writer thread to avoid blocking."""
+        """Thread function to process and store frames from the queue"""
         stored_frame = self.episode_frames[camera_idx]
         video_path = os.path.join(
             self.video_record_path,
@@ -202,7 +191,7 @@ class VideoRecorder:
         frame = first_frame.rgb
         height, width = frame.shape[:2]
         print("video_path", video_path)
-        self.video_writers[camera_idx] = cv2.VideoWriter(
+        self.video_writers[camera_idx] = cv2.VideoWriter(  # Store in instance variable
             video_path,
             cv2.VideoWriter_fourcc(*"mp4v"),
             fps,
@@ -210,16 +199,11 @@ class VideoRecorder:
         )
         if self.verbose:
             print(f"Initialized video writer for camera {camera_idx}")
-
-        # Clear the write buffer and start the async writer thread
-        self.write_buffers[camera_idx].clear()
-
+        video_writer = self.video_writers[camera_idx]  # Use local reference
         try:
             last_timestamp = first_frame.receive_time
             start_time = time.monotonic()
             frame_received = 0
-            missed_frames = 0
-            debug_interval = 60
 
             while self._recording_event.is_set():
                 with FrameRateContext(fps, verbose=self.verbose) as fr:
@@ -227,11 +211,16 @@ class VideoRecorder:
                         camera_idx, last_timestamp, timeout=1 / fps
                     )
                     if frame_data is None:
-                        missed_frames += 1
+                        print("No frames in queue!")
                         continue
-
-                    frame_received += 1
-                    last_timestamp = frame_data.receive_time
+                    else:
+                        frame_received += 1
+                        last_timestamp = frame_data.receive_time
+                        actual_fps = frame_received / (time.monotonic() - start_time)
+                        if self.verbose:
+                            print(
+                                f"Actual FPS for camera_{camera_idx} recording: {actual_fps}"
+                            )
 
                     for field in fields(self.frame_data_class):
                         value = getattr(frame_data, field.name)
@@ -239,47 +228,15 @@ class VideoRecorder:
                             if field.name == "rgb":
                                 if self.convert_bgr_to_rgb:
                                     value = cv2.cvtColor(value, cv2.COLOR_BGR2RGB)
-                                # Buffer frame for async writing instead of blocking
-                                self.write_buffers[camera_idx].append(value)
+                                video_writer.write(value)
+                                if self.verbose:
+                                    print(
+                                        f"Written frame to video for camera {camera_idx}"
+                                    )
                             if field.name in self.frame_data_class.numeric_fields():
                                 stored_frame[field.name].append(value)
-
-                    if frame_received % debug_interval == 0:
-                        elapsed = time.monotonic() - start_time
-                        avg_fps = frame_received / elapsed
-                        buf_len = len(self.write_buffers[camera_idx])
-                        print(
-                            f"[REC cam{camera_idx}] capture_fps={avg_fps:.1f} "
-                            f"buf={buf_len} missed={missed_frames}"
-                        )
         except Exception as e:
-            import traceback
-            print(f"Error in recording thread camera {camera_idx}: {e}")
-            traceback.print_exc()
-
-    def _video_writer_thread(self, camera_idx):
-        """Async thread that drains the write buffer to cv2.VideoWriter.
-        Runs during recording and continues after stop until buffer is empty."""
-        video_writer = self.video_writers[camera_idx]
-        write_buf = self.write_buffers[camera_idx]
-        frames_written = 0
-        start_time = time.monotonic()
-
-        while self._writing_event.is_set() or len(write_buf) > 0:
-            if len(write_buf) > 0:
-                frame = write_buf.popleft()
-                video_writer.write(frame)
-                frames_written += 1
-                if frames_written % 30 == 0:
-                    elapsed = time.monotonic() - start_time
-                    print(
-                        f"[WRITER cam{camera_idx}] encode_fps={frames_written/elapsed:.1f} "
-                        f"written={frames_written} buf={len(write_buf)}"
-                    )
-            else:
-                time.sleep(0.001)
-
-        print(f"[WRITER cam{camera_idx}] done. Total frames written: {frames_written}")
+            print(f"Error processing frame from camera {camera_idx}: {e}")
 
     def peek_latest_frame(self, camera_idx: int) -> Optional[FrameData]:
         """Peek the latest frame from the queue without removing it"""
@@ -415,12 +372,10 @@ class VideoRecorder:
             print("Recording is already in progress.")
             return False
         self._recording_event.set()
-        self._writing_event.set()
         time.sleep(0.5)
         try:
             print("Starting recording threads...")
             self.recording_threads = []
-            self.writer_threads = []
             for i in range(len(self.camera_sources)):
                 thread = Thread(
                     target=self._recording_thread, args=(i, self.episode_id)
@@ -428,16 +383,6 @@ class VideoRecorder:
                 thread.daemon = True
                 thread.start()
                 self.recording_threads.append(thread)
-
-            # Writer threads start after recording threads (need video_writers initialized)
-            time.sleep(0.5)
-            for i in range(len(self.camera_sources)):
-                wthread = Thread(
-                    target=self._video_writer_thread, args=(i,)
-                )
-                wthread.daemon = True
-                wthread.start()
-                self.writer_threads.append(wthread)
 
             print("Recording started successfully.")
             return True
@@ -483,18 +428,10 @@ class VideoRecorder:
         print("Stopping recording...")
         self._recording_event.clear()
 
-        # Wait for recording threads to finish
-        print("Waiting for recording threads to finish...")
+        # Wait for threads to finish
+        print("Waiting for threads to finish...")
         for thread in self.recording_threads:
             thread.join(timeout=2.0)
-
-        # Signal writer threads to stop (they will drain remaining buffer first)
-        self._writing_event.clear()
-        total_remaining = sum(len(b) for b in self.write_buffers)
-        if total_remaining > 0:
-            print(f"Encoding {total_remaining} buffered frames to video...")
-        for thread in self.writer_threads:
-            thread.join(timeout=120.0)  # Allow up to 2 min to drain buffer
 
         return True
 
